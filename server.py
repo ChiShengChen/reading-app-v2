@@ -10,10 +10,15 @@
 """
 import io
 import json
+import os
 import posixpath
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
+import threading
 import urllib.parse
 import urllib.request
 import zipfile
@@ -173,6 +178,93 @@ def extract_epub(data: bytes) -> str:
 
 MAX_UPLOAD = 100 * 1024 * 1024  # 100 MB
 
+# ---------------------------------------------------------------------------
+# 論文審稿模式:透過本機已登入的 Claude Code CLI (headless) 產生深度審稿報告
+# ---------------------------------------------------------------------------
+
+REVIEW_PROMPT = """\
+論文檔案在目前目錄的 paper.pdf。請先用 Read 工具把整篇論文讀完(超過 10 頁就分段用 pages 參數讀,\
+必須讀完全文包含附錄),讀完之後才開始寫報告。
+
+重要:閱讀過程中不要輸出任何過場說明文字(不要說「我先來閱讀」之類的話)。\
+你唯一的文字輸出就是最終那份完整的 Markdown 審稿報告本體,從第一個字開始就是報告內容。
+
+請深度解析附檔論文。目標:我讀完你的分析後,能向同行完整講解該方法,並在 Q&A 中回答技術追問\
+(conference talk 等級的理解)。
+
+我的背景:熟悉 deep learning(Transformer/attention、diffusion、contrastive/self-supervised \
+learning)、時序與頻域訊號處理(EEG/生理訊號)、基礎量子計算與 variational quantum circuits。\
+請跳過基礎概念解釋,直接進入這篇論文的特定設計。
+
+全程遵守的原則:
+- 解釋「為什麼這樣設計」,而非只描述「是什麼」。
+- 三層資訊標註:直接來自論文的內容為預設(關鍵 claim 請附 §/Eq./Table 編號);論文未明說、\
+由你合理推論的標【推論】;論文完全沒提、你以領域知識補充的標【補充】。禁止把推論寫成論文事實;\
+資訊不足就明說「論文未提供」,不要猜。
+- 篇幅分配:§2–3(方法與數學)至少佔全文一半。其他節依論文性質可壓縮到幾句,不要硬湊。
+- 若發現論文內部不一致(公式與文字矛盾、維度對不上、正文與附錄數字兜不攏),直接指出。
+
+## 1. 定位與故事(簡短)
+- 一句話總結:解決什麼問題、關鍵思路、達到什麼效果。
+- 在 research landscape 的位置:開創新方向、突破現有 pipeline 的某個瓶頸、還是新理論框架?
+- 與最相關的 2–3 篇 prior work 的具體差異:點名論文、指出差異點,不要泛泛說「過去方法不足」。
+- 為什麼能中這個 venue:hook 是什麼(新問題?反直覺結果?大幅提升?優雅理論?)、\
+故事線怎麼鋪陳、理論/實驗/可視化哪些元素撐起說服力。
+
+## 2. 方法:直覺 → 架構
+- 先用 2–3 句 high-level intuition:不看公式就能懂「它在做什麼、賭的是什麼假設」。
+- 完整 data flow:從原始輸入到最終輸出,資料經過哪些模組、每一步的目的。
+- 每個關鍵設計的動機:為什麼選這個而非替代方案?論文有無討論?若沒討論,【補充】你認為真正的原因。
+- 新提出的模組或機制:特別標註並詳解運作原理。
+
+## 3. 核心數學走查(最重要)
+選出 2–3 個最核心的運算/模組,每個做到:
+- 寫出公式(LaTeX),使用論文原始 notation;每個符號標註物理意義與維度。
+- 用具體 tensor shape 走完整個計算流程。超參數論文有給就用論文的;沒給則標【假設】。\
+例:輸入 [B=2, T=64, C=22] 的 EEG 訊號,每步操作後 shape 如何變化、為什麼。
+- 若涉及 attention:Q/K/V 的來源、shape、attention score 的完整計算過程。
+- 若涉及特殊數學(KL divergence、contrastive loss、variational bound 等):用 2–3 組具體數值示範計算。
+- 若涉及量子電路/擴散模型/其他非標準模組:用示意流程說明經典 ↔ 特殊表示之間的轉換。
+- 收尾:給出該核心模組的 PyTorch-style pseudocode(20–40 行),重點是 shape 正確、模組邏輯完整,\
+不求可直接執行。目標是我看完能自己寫出 forward pass。
+
+## 4. 證據鏈:Claim → 實驗 → 結果
+先用表格對齊論文的主要 claims(通常 2–4 個):Claim | 驗證實驗 | 關鍵數字 | 支持強度(強/中/弱)+理由
+再補充:
+- 資料集與 baseline 的選擇是否公平充分?有沒有明顯該比而沒比的方法?
+- 消融實驗:哪個模組貢獻最大、哪個可能可拿掉?
+- 統計顯著性、error bars、random seeds 有無交代?
+- Failure cases:論文坦承了什麼、迴避了什麼?
+
+## 5. 審稿人視角
+- 最強的 2–3 個優點,具體到能寫進 meta-review 的程度。
+- 最可質疑的 2–3 個弱點;claims 與證據之間有無邏輯跳躍?
+- 可重現性:是否開源、細節是否足夠、compute 需求多大?
+
+## 6. 對我的延伸價值
+- 可復用的技術模組或設計模式,結合我的方向評估:frequency-domain physiological signals、\
+EEG foundation models、quantum-classical hybrid ML。
+- 基於此工作最有潛力的 2–3 個延伸方向,以及值得探索的 open questions。
+
+## 7. 收尾:模擬 Q&A 自測
+出 5 題同行或審稿人最可能追問的尖銳技術問題(至少 2 題針對數學細節、1 題針對實驗弱點),\
+每題附 2–3 句參考答案。這是檢驗我是否真的理解的自測題。
+
+## 8. 正式評審結論
+- 先判斷這篇論文最適合的 venue 類型(頂會如 NeurIPS/ICML/ICLR/MICCAI,或期刊)。
+- 若是頂會:給出該會議格式的評分(例如 NeurIPS: Rating 1–10、Confidence 1–5、\
+Soundness/Presentation/Contribution 各 1–4),附 2–3 句理由。
+- 若是期刊:給出審稿結果建議(Accept / Minor Revision / Major Revision / Reject)與理由。
+- 最後附上正式的 Comments to Authors(用英文,照審稿慣例):Summary、Strengths、Weaknesses、\
+Questions to Authors、Minor Issues。
+
+輸出格式:Markdown、公式用 LaTeX($...$ 與 $$...$$)。寧可深挖少數關鍵點,不要淺嚐所有細節。
+"""
+
+CLAUDE_CMD = ["claude", "-p", "--output-format", "stream-json",
+              "--include-partial-messages", "--verbose",
+              "--model", "opus", "--allowedTools", "Read"]
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -208,6 +300,9 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/extract":
             self._handle_extract(parsed)
+            return
+        if path == "/review":
+            self._handle_review()
             return
         if path != "/translate":
             self._send(404, b"not found", "text/plain")
@@ -252,6 +347,89 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"text": text})
         except Exception as exc:
             self._send_json(500, {"error": f"解析失敗: {exc}"})
+
+    # ---- 審稿模式:chunked 串流回應 ----
+
+    def _chunk(self, obj) -> None:
+        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+        self.wfile.flush()
+
+    def _handle_review(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > MAX_UPLOAD:
+            self._send_json(400, {"error": "沒有收到檔案或檔案太大"})
+            return
+        data = self.rfile.read(length)
+        if data[:5] != b"%PDF-":
+            self._send_json(400, {"error": "審稿模式只接受 PDF 檔"})
+            return
+
+        tmpdir = tempfile.mkdtemp(prefix="paper_review_")
+        proc = None
+        try:
+            with open(os.path.join(tmpdir, "paper.pdf"), "wb") as f:
+                f.write(data)
+
+            proc = subprocess.Popen(
+                CLAUDE_CMD, cwd=tmpdir,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8")
+            threading.Thread(  # 送 prompt 後關閉 stdin,避免阻塞
+                target=lambda: (proc.stdin.write(REVIEW_PROMPT), proc.stdin.close()),
+                daemon=True).start()
+
+            # 開始 chunked 串流
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+            final_text, is_error = None, False
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                mtype = msg.get("type")
+                if mtype == "stream_event":
+                    event = msg.get("event") or {}
+                    etype = event.get("type")
+                    if etype == "content_block_delta":
+                        delta = event.get("delta") or {}
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            self._chunk({"t": "delta", "text": delta["text"]})
+                    elif etype == "content_block_start":
+                        block = event.get("content_block") or {}
+                        if block.get("type") == "tool_use":
+                            self._chunk({"t": "status", "text": "Claude 正在閱讀論文…"})
+                elif mtype == "result":
+                    final_text = msg.get("result")
+                    is_error = bool(msg.get("is_error"))
+
+            proc.wait(timeout=30)
+            if final_text and not is_error:
+                self._chunk({"t": "final", "text": final_text})
+            else:
+                err = (proc.stderr.read() or "")[-500:] or "claude CLI 沒有回傳結果"
+                self._chunk({"t": "error", "text": err})
+            self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 使用者關頁面/中斷,下面 finally 會收拾子行程
+        except Exception as exc:
+            try:
+                self._chunk({"t": "error", "text": f"審稿失敗: {exc}"})
+                self.wfile.write(b"0\r\n\r\n")
+            except OSError:
+                pass
+        finally:
+            if proc and proc.poll() is None:
+                proc.kill()
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def log_message(self, fmt, *args):  # 安靜一點,只留錯誤
         if args and str(args[1]).startswith(("4", "5")):

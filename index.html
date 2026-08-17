@@ -87,7 +87,42 @@
   body[data-view="orig"]  .trans{display:none}
   body[data-view="orig"]  .orig{color:var(--ink); border-top:0; margin-top:0; padding-top:0; font-size:var(--font-size)}
   .hidden{display:none !important}
+
+  /* ---- 審稿模式 ---- */
+  #modeSeg{margin-bottom:1rem}
+  #modeSeg button{padding:.45rem 1rem; font-size:.95rem}
+  .drop{
+    border:2px dashed var(--line); border-radius:.75rem; background:var(--card);
+    padding:2.2rem 1rem; text-align:center; color:var(--muted); cursor:pointer;
+  }
+  .drop b{color:var(--ink)}
+  #reviewDoc{
+    background:var(--card); border:1px solid var(--line); border-radius:.75rem;
+    padding:1.4rem 1.6rem; font-size:calc(var(--font-size)*.95); overflow-x:auto;
+  }
+  #reviewDoc h1,#reviewDoc h2,#reviewDoc h3,#reviewDoc h4{margin:1.2em 0 .5em; line-height:1.4}
+  #reviewDoc h1{font-size:1.45em} #reviewDoc h2{font-size:1.25em; border-bottom:1px solid var(--line); padding-bottom:.25em}
+  #reviewDoc h3{font-size:1.1em} #reviewDoc p{margin:.6em 0}
+  #reviewDoc ul,#reviewDoc ol{margin:.6em 0; padding-left:1.6em}
+  #reviewDoc li{margin:.25em 0}
+  #reviewDoc code{background:var(--bg); border:1px solid var(--line); border-radius:.3em; padding:.08em .35em; font-size:.9em}
+  #reviewDoc pre{background:var(--bg); border:1px solid var(--line); border-radius:.5em; padding:.8em 1em; overflow-x:auto; margin:.8em 0; line-height:1.5}
+  #reviewDoc pre code{background:none; border:0; padding:0}
+  #reviewDoc table{border-collapse:collapse; margin:.8em 0; width:100%; display:block; overflow-x:auto}
+  #reviewDoc th,#reviewDoc td{border:1px solid var(--line); padding:.4em .7em; text-align:left; vertical-align:top}
+  #reviewDoc th{background:var(--bg)}
+  #reviewDoc blockquote{border-left:3px solid var(--accent); margin:.8em 0; padding:.2em 1em; color:var(--muted)}
+  #reviewDoc hr{border:0; border-top:1px solid var(--line); margin:1.2em 0}
+  #reviewStatus{color:var(--muted); font-size:.9em; margin-bottom:.8rem}
+  #reviewStatus .spin{display:inline-block; animation:spin 1.2s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
 </style>
+<script>
+  window.MathJax = { tex: { inlineMath: [["$","$"],["\\(","\\)"]],
+                            displayMath: [["$$","$$"],["\\[","\\]"]] },
+                     startup: { typeset: false } };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
 </head>
 <body data-view="both">
 
@@ -117,6 +152,12 @@
 <main>
   <!-- 輸入畫面 -->
   <section id="inputView">
+    <div class="seg" id="modeSeg" style="display:inline-flex">
+      <button data-m="tr" class="on">📖 逐段翻譯</button>
+      <button data-m="rev">🔍 論文審稿</button>
+    </div>
+
+    <div id="translatePane">
     <div class="row">
       <button class="btn" id="fileBtn">📄 開啟檔案 (.txt / .md / .pdf / .epub)</button>
       <input type="file" id="fileInput" accept=".txt,.md,.text,.pdf,.epub,text/plain,application/pdf,application/epub+zip">
@@ -127,6 +168,29 @@
       <button class="btn primary" id="startBtn">開始逐段翻譯 ▸</button>
       <span class="hint">空一行 = 一段。翻譯過的段落會記住，下次不用重翻。</span>
     </div>
+    </div><!-- /translatePane -->
+
+    <div id="reviewPane" class="hidden">
+      <div class="drop" id="reviewDrop">
+        📄 點這裡選擇論文 PDF（或把檔案拖進來）<br>
+        <b id="reviewFileName">尚未選擇檔案</b>
+      </div>
+      <input type="file" id="reviewFileInput" accept=".pdf,application/pdf">
+      <div class="row">
+        <button class="btn primary" id="reviewStartBtn" disabled>開始深度審稿 ▸</button>
+        <span class="hint">Claude 會逐頁閱讀 PDF 後產出審稿報告（方法數學走查、證據鏈、審稿人視角、
+        頂會評分與 comments to authors）。約需 5–15 分鐘，使用你的 Claude Code 訂閱額度。</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 審稿報告畫面 -->
+  <section id="reviewView" class="hidden">
+    <div id="reviewStatus"></div>
+    <div class="row">
+      <button class="btn hidden" id="reviewSaveBtn">⬇ 下載 Markdown</button>
+    </div>
+    <div id="reviewDoc"></div>
   </section>
 
   <!-- 閱讀畫面 -->
@@ -269,6 +333,7 @@ function start(){
 $("startBtn").onclick = start;
 $("backBtn").onclick = () => {
   $("readView").classList.add("hidden");
+  $("reviewView").classList.add("hidden");
   $("backBtn").classList.add("hidden");
   $("inputView").classList.remove("hidden");
 };
@@ -326,6 +391,163 @@ $("themeBtn").onclick = () => {
   document.documentElement.dataset.theme = next;
   try { localStorage.setItem("theme", next); } catch(e){}
 };
+
+/* ---------- 論文審稿模式 ---------- */
+$("modeSeg").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  [...$("modeSeg").children].forEach(x => x.classList.toggle("on", x === b));
+  $("translatePane").classList.toggle("hidden", b.dataset.m !== "tr");
+  $("reviewPane").classList.toggle("hidden", b.dataset.m !== "rev");
+});
+
+let reviewFile = null, reviewText = "";
+function pickReviewFile(f){
+  if (!f) return;
+  if (!/\.pdf$/i.test(f.name)) { $("reviewFileName").textContent = "⚠ 只接受 PDF 檔"; return; }
+  reviewFile = f;
+  $("reviewFileName").textContent = `${f.name}（${(f.size/1048576).toFixed(1)} MB）`;
+  $("reviewStartBtn").disabled = false;
+}
+$("reviewDrop").onclick = () => $("reviewFileInput").click();
+$("reviewFileInput").onchange = () => pickReviewFile($("reviewFileInput").files[0]);
+$("reviewDrop").ondragover = e => e.preventDefault();
+$("reviewDrop").ondrop = e => { e.preventDefault(); pickReviewFile(e.dataTransfer.files[0]); };
+
+const setRStatus = h => { $("reviewStatus").innerHTML = h; };
+
+$("reviewStartBtn").onclick = async () => {
+  if (!reviewFile) return;
+  $("inputView").classList.add("hidden");
+  $("readView").classList.add("hidden");
+  $("reviewView").classList.remove("hidden");
+  $("backBtn").classList.remove("hidden");
+  $("reviewDoc").innerHTML = "";
+  $("reviewSaveBtn").classList.add("hidden");
+  setRStatus('<span class="spin">◐</span> 上傳論文並啟動 Claude…');
+  window.scrollTo(0, 0);
+
+  let buf = "", lastRender = 0;
+  try {
+    const resp = await fetch("/review", { method: "POST", body: reviewFile });
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.error || ("HTTP " + resp.status));
+    }
+    const reader = resp.body.getReader(), dec = new TextDecoder();
+    let pending = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += dec.decode(value, { stream: true });
+      const lines = pending.split("\n"); pending = lines.pop();
+      for (const ln of lines) {
+        if (!ln.trim()) continue;
+        let m; try { m = JSON.parse(ln); } catch (e) { continue; }
+        if (m.t === "delta") {
+          buf += m.text;
+          setRStatus('<span class="spin">◐</span> Claude 正在撰寫審稿報告…');
+          const now = Date.now();
+          if (now - lastRender > 500) { lastRender = now; $("reviewDoc").innerHTML = mdRender(buf); }
+        } else if (m.t === "status" && !buf) {
+          setRStatus('<span class="spin">◐</span> ' + esc(m.text));
+        } else if (m.t === "final") {
+          buf = m.text;
+        } else if (m.t === "error") {
+          throw new Error(m.text);
+        }
+      }
+    }
+    if (!buf.trim()) throw new Error("沒有收到報告內容");
+    reviewText = buf;
+    $("reviewDoc").innerHTML = mdRender(buf);
+    setRStatus("✅ 審稿完成");
+    $("reviewSaveBtn").classList.remove("hidden");
+    if (window.MathJax && MathJax.typesetPromise)
+      MathJax.typesetPromise([$("reviewDoc")]).catch(() => {});
+  } catch (err) {
+    setRStatus("⚠ " + esc(err.message) + (buf ? "（以下為中斷前的內容）" : ""));
+    if (buf) $("reviewDoc").innerHTML = mdRender(buf);
+  }
+};
+
+$("reviewSaveBtn").onclick = () => {
+  const blob = new Blob([reviewText], { type: "text/markdown;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (reviewFile ? reviewFile.name.replace(/\.pdf$/i, "") : "paper") + "_review.md";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+/* ---------- 迷你 Markdown 渲染器（支援表格/程式碼/LaTeX 佔位保護） ---------- */
+function splitRow(ln){ return ln.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim()); }
+
+function mdRender(src){
+  const stash = [];
+  const keep = h => "" + (stash.push(h) - 1) + "";
+  let s = src.replace(/\r/g, "");
+  // 先把程式碼與數學式抽出保護,避免被 Markdown 規則弄壞
+  s = s.replace(/```\w*\n?([\s\S]*?)(?:```|$)/g, (m, body) => keep("<pre><code>" + esc(body) + "</code></pre>"));
+  s = s.replace(/\$\$[\s\S]*?\$\$/g, m => keep(esc(m)));
+  s = s.replace(/\\\[[\s\S]*?\\\]/g, m => keep(esc(m)));
+  s = s.replace(/`([^`\n]+)`/g, (m, c) => keep("<code>" + esc(c) + "</code>"));
+  s = s.replace(/\$([^$\n]+?)\$/g, m => keep(esc(m)));
+  s = esc(s);
+
+  const inline = t => t
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, "$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  const lines = s.split("\n"), out = [];
+  let i = 0, para = [];
+  const flush = () => { if (para.length) { out.push("<p>" + inline(para.join(" ")) + "</p>"); para = []; } };
+
+  while (i < lines.length) {
+    const ln = lines[i];
+    let m;
+    if (/^\s*$/.test(ln)) { flush(); i++; continue; }
+    if (m = ln.match(/^(#{1,6})\s+(.*)/)) {
+      flush(); const l = m[1].length;
+      out.push(`<h${l}>` + inline(m[2]) + `</h${l}>`); i++; continue;
+    }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(ln)) { flush(); out.push("<hr>"); i++; continue; }
+    if (/^\s*&gt;/.test(ln)) {
+      flush(); const q = [];
+      while (i < lines.length && /^\s*&gt;/.test(lines[i])) { q.push(lines[i].replace(/^\s*&gt;\s?/, "")); i++; }
+      out.push("<blockquote>" + inline(q.join(" ")) + "</blockquote>"); continue;
+    }
+    if (/^\s*\|/.test(ln) && i + 1 < lines.length
+        && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i+1]) && lines[i+1].includes("-")) {
+      flush();
+      const header = splitRow(ln); i += 2; const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) { rows.push(splitRow(lines[i])); i++; }
+      let h = "<table><thead><tr>" + header.map(c => "<th>" + inline(c) + "</th>").join("") + "</tr></thead><tbody>";
+      for (const r of rows) h += "<tr>" + r.map(c => "<td>" + inline(c) + "</td>").join("") + "</tr>";
+      out.push(h + "</tbody></table>"); continue;
+    }
+    if (m = ln.match(/^\s*([-*+]|\d+[.)])\s+(.*)/)) {
+      flush();
+      const ordered = /\d/.test(m[1]);
+      out.push(ordered ? "<ol>" : "<ul>");
+      while (i < lines.length) {
+        const lm = lines[i].match(/^\s*([-*+]|\d+[.)])\s+(.*)/);
+        if (!lm) {
+          if (/^\s{2,}\S/.test(lines[i])) {   // 縮排的接續行,併入上一個項目
+            out[out.length-1] = out[out.length-1].replace(/<\/li>$/, " " + inline(lines[i].trim()) + "</li>");
+            i++; continue;
+          }
+          break;
+        }
+        out.push("<li>" + inline(lm[2]) + "</li>"); i++;
+      }
+      out.push(ordered ? "</ol>" : "</ul>"); continue;
+    }
+    para.push(ln.trim()); i++;
+  }
+  flush();
+  return out.join("\n").replace(/(\d+)/g, (m, n) => stash[n]);
+}
 
 /* 還原上次狀態 */
 (function restore(){
