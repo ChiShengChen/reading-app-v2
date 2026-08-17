@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""逐段翻譯閱讀器 — 本機伺服器
+
+用法:  python3 server.py  [埠號, 預設 8765]
+然後用瀏覽器開 http://localhost:8765
+手機連同一個 Wi-Fi 後,開 http://<這台電腦的IP>:8765
+
+翻譯來源: Google 翻譯免費網頁介面 (translate.googleapis.com)
+不需要 API key、不需要安裝任何 Python 套件。
+"""
+import json
+import socket
+import sys
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+
+GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def google_translate(text: str, target: str, source: str = "auto") -> dict:
+    """呼叫 Google 翻譯的 gtx 端點,回傳 {'text': 譯文, 'src': 偵測到的來源語言}"""
+    params = urllib.parse.urlencode({
+        "client": "gtx", "sl": source, "tl": target, "dt": "t", "dj": "1",
+    })
+    data = urllib.parse.urlencode({"q": text}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{GOOGLE_URL}?{params}", data=data,
+        headers={"User-Agent": UA,
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    # dj=1 時回傳 {"sentences": [{"trans": ...}, ...], "src": "en"}
+    translated = "".join(s.get("trans", "") for s in payload.get("sentences", []))
+    return {"text": translated, "src": payload.get("src", "")}
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, code: int, obj: dict) -> None:
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            try:
+                body = (ROOT / "index.html").read_bytes()
+            except FileNotFoundError:
+                self._send(500, "index.html 不存在".encode(), "text/plain; charset=utf-8")
+                return
+            self._send(200, body, "text/html; charset=utf-8")
+        elif path == "/ping":
+            self._send_json(200, {"ok": True})
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/translate":
+            self._send(404, b"not found", "text/plain")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(length).decode("utf-8"))
+            text = (req.get("text") or "").strip()
+            target = req.get("target") or "zh-TW"
+            source = req.get("source") or "auto"
+            if not text:
+                self._send_json(400, {"error": "文字是空的"})
+                return
+            result = google_translate(text, target, source)
+            self._send_json(200, result)
+        except Exception as exc:  # 回報給前端顯示,不讓伺服器掛掉
+            self._send_json(502, {"error": f"翻譯失敗: {exc}"})
+
+    def log_message(self, fmt, *args):  # 安靜一點,只留錯誤
+        if args and str(args[1]).startswith(("4", "5")):
+            super().log_message(fmt, *args)
+
+
+def lan_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print("逐段翻譯閱讀器已啟動:")
+    print(f"  這台電腦:  http://localhost:{PORT}")
+    print(f"  手機(同 Wi-Fi): http://{lan_ip()}:{PORT}")
+    print("按 Ctrl+C 停止")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")

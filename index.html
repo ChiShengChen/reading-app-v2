@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>逐段翻譯閱讀器</title>
+<style>
+  :root{
+    --bg:#faf8f4; --card:#ffffff; --ink:#1f2430; --muted:#6b7280;
+    --accent:#2563eb; --line:#e5e1d8; --err:#b91c1c; --err-bg:#fef2f2;
+    --font-size:1.05rem;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#15171c; --card:#1e2128; --ink:#e8e6e1; --muted:#9aa0ab;
+      --accent:#7aa2f7; --line:#2c3038; --err:#f87171; --err-bg:#2a1d1d;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#15171c; --card:#1e2128; --ink:#e8e6e1; --muted:#9aa0ab;
+    --accent:#7aa2f7; --line:#2c3038; --err:#f87171; --err-bg:#2a1d1d;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    background:var(--bg); color:var(--ink);
+    font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+    line-height:1.75;
+  }
+  header{
+    position:sticky; top:0; z-index:10;
+    background:var(--bg); border-bottom:1px solid var(--line);
+    padding:.55rem max(0.9rem, env(safe-area-inset-left));
+    display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;
+  }
+  header h1{font-size:1rem; font-weight:700; margin-right:auto; white-space:nowrap}
+  .btn, select{
+    font:inherit; font-size:.85rem; color:var(--ink);
+    background:var(--card); border:1px solid var(--line); border-radius:.5rem;
+    padding:.3rem .65rem; cursor:pointer;
+  }
+  .btn:active{transform:translateY(1px)}
+  .btn.primary{background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600}
+  .seg{display:flex; border:1px solid var(--line); border-radius:.5rem; overflow:hidden}
+  .seg button{
+    font:inherit; font-size:.85rem; border:0; background:var(--card);
+    color:var(--muted); padding:.3rem .6rem; cursor:pointer;
+  }
+  .seg button.on{background:var(--accent); color:#fff}
+  main{max-width:44rem; margin:0 auto; padding:1rem max(1rem, env(safe-area-inset-left)) 4rem}
+
+  /* ---- 輸入畫面 ---- */
+  #inputView textarea{
+    width:100%; min-height:45vh; resize:vertical;
+    font:inherit; font-size:.95rem; color:var(--ink);
+    background:var(--card); border:1px solid var(--line); border-radius:.75rem;
+    padding:.9rem; line-height:1.7;
+  }
+  #inputView .row{display:flex; gap:.6rem; flex-wrap:wrap; align-items:center; margin:.8rem 0}
+  #inputView .hint{color:var(--muted); font-size:.85rem}
+  input[type=file]{display:none}
+
+  /* ---- 進度 ---- */
+  #progressWrap{
+    position:sticky; top:calc(2.6rem + 1px); z-index:9;
+    height:3px; background:var(--line); border-radius:2px; overflow:hidden;
+    margin-bottom:1rem; opacity:1; transition:opacity .6s;
+  }
+  #progressWrap.done{opacity:0}
+  #progressBar{height:100%; width:0; background:var(--accent); transition:width .3s}
+  #status{color:var(--muted); font-size:.85rem; margin:-.4rem 0 1rem}
+
+  /* ---- 段落 ---- */
+  .para{
+    background:var(--card); border:1px solid var(--line); border-radius:.75rem;
+    padding:.9rem 1.05rem; margin-bottom:.9rem;
+  }
+  .para .trans{font-size:var(--font-size)}
+  .para .orig{
+    color:var(--muted); font-size:calc(var(--font-size)*.88);
+    border-top:1px dashed var(--line); margin-top:.6rem; padding-top:.6rem;
+  }
+  .para .trans.pending{color:var(--muted); font-style:italic}
+  .para.error .trans{color:var(--err)}
+  .para.error{background:var(--err-bg); cursor:pointer}
+  body[data-view="trans"] .orig{display:none}
+  body[data-view="orig"]  .trans{display:none}
+  body[data-view="orig"]  .orig{color:var(--ink); border-top:0; margin-top:0; padding-top:0; font-size:var(--font-size)}
+  .hidden{display:none !important}
+</style>
+</head>
+<body data-view="both">
+
+<header>
+  <h1>逐段翻譯閱讀器</h1>
+  <select id="target" title="翻譯成">
+    <option value="zh-TW" selected>繁體中文</option>
+    <option value="zh-CN">简体中文</option>
+    <option value="en">English</option>
+    <option value="ja">日本語</option>
+    <option value="ko">한국어</option>
+    <option value="fr">Français</option>
+    <option value="de">Deutsch</option>
+    <option value="es">Español</option>
+  </select>
+  <div class="seg" id="viewSeg" title="顯示模式">
+    <button data-v="both" class="on">對照</button>
+    <button data-v="trans">譯文</button>
+    <button data-v="orig">原文</button>
+  </div>
+  <button class="btn" id="fontMinus" title="縮小字體">A−</button>
+  <button class="btn" id="fontPlus" title="放大字體">A＋</button>
+  <button class="btn" id="themeBtn" title="切換深淺色">◐</button>
+  <button class="btn hidden" id="backBtn">✎ 換文章</button>
+</header>
+
+<main>
+  <!-- 輸入畫面 -->
+  <section id="inputView">
+    <div class="row">
+      <button class="btn" id="fileBtn">📄 開啟檔案 (.txt / .md)</button>
+      <input type="file" id="fileInput" accept=".txt,.md,.text,text/plain">
+      <span class="hint" id="fileName"></span>
+    </div>
+    <textarea id="srcText" placeholder="把要閱讀的文章貼在這裡（任何語言都可以，會自動偵測）…"></textarea>
+    <div class="row">
+      <button class="btn primary" id="startBtn">開始逐段翻譯 ▸</button>
+      <span class="hint">空一行 = 一段。翻譯過的段落會記住，下次不用重翻。</span>
+    </div>
+  </section>
+
+  <!-- 閱讀畫面 -->
+  <section id="readView" class="hidden">
+    <div id="progressWrap"><div id="progressBar"></div></div>
+    <div id="status"></div>
+    <div id="paras"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const state = { paras: [], target: "zh-TW", running: false, done: 0 };
+
+/* ---------- 小工具 ---------- */
+function hash(s){ let h = 5381; for (let i = 0; i < s.length; i++) h = (h * 33 ^ s.charCodeAt(i)) >>> 0; return h.toString(36); }
+const cacheKey = (text, target) => "tr:" + target + ":" + hash(text);
+function cacheGet(text, target){ try { return localStorage.getItem(cacheKey(text, target)); } catch(e){ return null; } }
+function cacheSet(text, target, val){ try { localStorage.setItem(cacheKey(text, target), val); } catch(e){ /* 滿了就算了 */ } }
+
+/* ---------- 分段 ---------- */
+function splitParagraphs(raw){
+  let parts = raw.split(/\n\s*\n+/).map(s => s.trim()).filter(Boolean);
+  if (parts.length <= 1)   // 沒有空行分段,退而求其次用單一換行
+    parts = raw.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  // 太長的段落再依句子切,避免翻譯請求過大
+  const MAX = 1600, out = [];
+  for (const p of parts){
+    if (p.length <= MAX){ out.push(p); continue; }
+    const sentences = p.match(/[^.!?。！？]+[.!?。！？]*\s*/g) || [p];
+    let buf = "";
+    for (const s of sentences){
+      if (buf && (buf.length + s.length) > MAX){ out.push(buf.trim()); buf = ""; }
+      buf += s;
+    }
+    if (buf.trim()) out.push(buf.trim());
+  }
+  return out;
+}
+
+/* ---------- 翻譯 ---------- */
+async function translateOne(i){
+  const p = state.paras[i];
+  const cached = cacheGet(p.orig, state.target);
+  if (cached){ p.trans = cached; p.status = "ok"; render(i); return; }
+  try {
+    const resp = await fetch("/translate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ text: p.orig, target: state.target })
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || resp.status);
+    p.trans = data.text; p.status = "ok";
+    cacheSet(p.orig, state.target, data.text);
+  } catch (err) {
+    p.trans = "⚠ 這段翻譯失敗（點一下重試）"; p.status = "error";
+  }
+  render(i);
+}
+
+async function runQueue(){
+  if (state.running) return;
+  state.running = true;
+  const WORKERS = 2;   // 同時 2 段,穩定不易被限流
+  let next = 0;
+  async function worker(){
+    while (next < state.paras.length){
+      const i = next++;
+      if (state.paras[i].status === "ok") { bumpProgress(); continue; }
+      await translateOne(i);
+      bumpProgress();
+      await new Promise(r => setTimeout(r, 250));
+    }
+  }
+  state.done = 0;
+  await Promise.all(Array.from({length: WORKERS}, worker));
+  state.running = false;
+  const failed = state.paras.filter(p => p.status === "error").length;
+  $("status").textContent = failed
+    ? `完成,但有 ${failed} 段失敗 — 點紅色段落可重試`
+    : `全部 ${state.paras.length} 段翻譯完成`;
+  $("progressWrap").classList.add("done");
+}
+
+function bumpProgress(){
+  state.done++;
+  const pct = Math.round(100 * state.done / state.paras.length);
+  $("progressBar").style.width = pct + "%";
+  $("status").textContent = `翻譯中… ${state.done} / ${state.paras.length} 段`;
+}
+
+/* ---------- 畫面 ---------- */
+function esc(s){ const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+function buildList(){
+  $("paras").innerHTML = state.paras.map((p, i) => `
+    <div class="para" id="p${i}">
+      <div class="trans pending">（等待翻譯…）</div>
+      <div class="orig">${esc(p.orig)}</div>
+    </div>`).join("");
+}
+
+function render(i){
+  const p = state.paras[i], el = $("p" + i);
+  if (!el) return;
+  const t = el.querySelector(".trans");
+  t.textContent = p.trans || "（等待翻譯…）";
+  t.classList.toggle("pending", !p.trans);
+  el.classList.toggle("error", p.status === "error");
+}
+
+$("paras").addEventListener("click", async e => {
+  const el = e.target.closest(".para.error");
+  if (!el || state.running) return;
+  const i = +el.id.slice(1);
+  state.paras[i].status = ""; state.paras[i].trans = "（重試中…）"; render(i);
+  await translateOne(i);
+  const failed = state.paras.filter(p => p.status === "error").length;
+  if (!failed) $("status").textContent = `全部 ${state.paras.length} 段翻譯完成`;
+});
+
+/* ---------- 流程 ---------- */
+function start(){
+  const raw = $("srcText").value;
+  if (!raw.trim()){ $("srcText").focus(); return; }
+  state.target = $("target").value;
+  state.paras = splitParagraphs(raw).map(orig => ({ orig, trans: "", status: "" }));
+  try { localStorage.setItem("lastText", raw); localStorage.setItem("lastTarget", state.target); } catch(e){}
+  $("inputView").classList.add("hidden");
+  $("readView").classList.remove("hidden");
+  $("backBtn").classList.remove("hidden");
+  $("progressWrap").classList.remove("done");
+  $("progressBar").style.width = "0";
+  buildList();
+  window.scrollTo(0, 0);
+  runQueue();
+}
+
+$("startBtn").onclick = start;
+$("backBtn").onclick = () => {
+  $("readView").classList.add("hidden");
+  $("backBtn").classList.add("hidden");
+  $("inputView").classList.remove("hidden");
+};
+$("target").onchange = () => {   // 閱讀中換語言 → 直接用新語言重跑
+  if (!$("readView").classList.contains("hidden") && !state.running){
+    state.target = $("target").value;
+    state.paras.forEach(p => { p.trans = ""; p.status = ""; });
+    buildList(); $("progressWrap").classList.remove("done"); $("progressBar").style.width = "0";
+    runQueue();
+  }
+};
+
+/* 檔案開啟 */
+$("fileBtn").onclick = () => $("fileInput").click();
+$("fileInput").onchange = () => {
+  const f = $("fileInput").files[0];
+  if (!f) return;
+  $("fileName").textContent = f.name;
+  const r = new FileReader();
+  r.onload = () => { $("srcText").value = r.result; };
+  r.readAsText(f);
+};
+
+/* 顯示模式 / 字體 / 深淺色 */
+$("viewSeg").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  document.body.dataset.view = b.dataset.v;
+  [...$("viewSeg").children].forEach(x => x.classList.toggle("on", x === b));
+  try { localStorage.setItem("view", b.dataset.v); } catch(e){}
+});
+let fontSize = 1.05;
+function applyFont(){ document.documentElement.style.setProperty("--font-size", fontSize + "rem");
+  try { localStorage.setItem("fontSize", fontSize); } catch(e){} }
+$("fontPlus").onclick  = () => { fontSize = Math.min(1.6, +(fontSize + 0.08).toFixed(2)); applyFont(); };
+$("fontMinus").onclick = () => { fontSize = Math.max(0.8, +(fontSize - 0.08).toFixed(2)); applyFont(); };
+$("themeBtn").onclick = () => {
+  const cur = document.documentElement.dataset.theme;
+  const next = cur === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("theme", next); } catch(e){}
+};
+
+/* 還原上次狀態 */
+(function restore(){
+  try {
+    const t = localStorage.getItem("theme");
+    if (t) document.documentElement.dataset.theme = t;
+    const f = parseFloat(localStorage.getItem("fontSize"));
+    if (f){ fontSize = f; applyFont(); }
+    const v = localStorage.getItem("view");
+    if (v){ document.body.dataset.view = v;
+      [...$("viewSeg").children].forEach(x => x.classList.toggle("on", x.dataset.v === v)); }
+    const txt = localStorage.getItem("lastText");
+    if (txt) $("srcText").value = txt;
+    const tg = localStorage.getItem("lastTarget");
+    if (tg) $("target").value = tg;
+  } catch(e){}
+})();
+</script>
+</body>
+</html>
