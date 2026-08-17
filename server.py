@@ -8,13 +8,28 @@
 翻譯來源: Google 翻譯免費網頁介面 (translate.googleapis.com)
 不需要 API key、不需要安裝任何 Python 套件。
 """
+import io
 import json
+import posixpath
+import re
 import socket
 import sys
 import urllib.parse
 import urllib.request
+import zipfile
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from xml.etree import ElementTree
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
 
 ROOT = Path(__file__).resolve().parent
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
@@ -39,6 +54,124 @@ def google_translate(text: str, target: str, source: str = "auto") -> dict:
     # dj=1 時回傳 {"sentences": [{"trans": ...}, ...], "src": "en"}
     translated = "".join(s.get("trans", "") for s in payload.get("sentences", []))
     return {"text": translated, "src": payload.get("src", "")}
+
+
+def _is_cjk(ch: str) -> bool:
+    return "一" <= ch <= "鿿" or "　" <= ch <= "ヿ" \
+        or "豈" <= ch <= "﫿" or "＀" <= ch <= "￯"
+
+
+def _join_wrapped_lines(text: str) -> str:
+    """把一個段落區塊裡被硬換行切開的行接回一行"""
+    buf = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not buf:
+            buf = line
+        elif buf.endswith("-") and len(buf) > 1 and buf[-2].isalpha():
+            buf = buf[:-1] + line          # 英文連字號斷行
+        elif _is_cjk(buf[-1]) or _is_cjk(line[0]):
+            buf += line                    # 中日韓文字直接相連
+        else:
+            buf += " " + line
+    return buf
+
+
+def extract_pdf(data: bytes) -> str:
+    """PDF → 純文字,段落之間以空行分隔"""
+    if fitz is not None:
+        paras = []
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            for page in doc:
+                # blocks 模式會依版面把文字分成區塊,區塊≈段落
+                for block in page.get_text("blocks"):
+                    if block[6] != 0:      # 只要文字區塊,跳過圖片
+                        continue
+                    joined = _join_wrapped_lines(block[4])
+                    if joined:
+                        paras.append(joined)
+        return "\n\n".join(paras)
+    if pypdf is not None:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        pages = [(p.extract_text() or "") for p in reader.pages]
+        blocks = re.split(r"\n\s*\n+", "\n\n".join(pages))
+        return "\n\n".join(filter(None, (_join_wrapped_lines(b) for b in blocks)))
+    raise RuntimeError("找不到 PDF 解析套件,請執行: pip install pymupdf")
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """把 XHTML 內容轉成純文字,在區塊元素邊界斷段"""
+    BLOCK_TAGS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li",
+                  "blockquote", "section", "article", "tr", "br", "table"}
+    SKIP_TAGS = {"script", "style", "head", "title"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.chunks = [""]
+        self._skip_depth = 0
+
+    def _break(self):
+        if self.chunks[-1].strip():
+            self.chunks.append("")
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag in self.BLOCK_TAGS:
+            self._break()
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif tag in self.BLOCK_TAGS:
+            self._break()
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self.chunks[-1] += data
+
+    def text(self) -> str:
+        paras = (re.sub(r"\s+", " ", c).strip() for c in self.chunks)
+        return "\n\n".join(p for p in paras if p)
+
+
+def extract_epub(data: bytes) -> str:
+    """EPUB → 純文字,依 spine 順序串起各章,段落以空行分隔"""
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        container = ElementTree.fromstring(zf.read("META-INF/container.xml"))
+        opf_path = container.find(
+            ".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"
+        ).get("full-path")
+        opf_dir = posixpath.dirname(opf_path)
+        opf = ElementTree.fromstring(zf.read(opf_path))
+        ns = {"opf": "http://www.idpf.org/2007/opf"}
+
+        manifest = {item.get("id"): item.get("href")
+                    for item in opf.findall(".//opf:manifest/opf:item", ns)}
+        spine = [ref.get("idref")
+                 for ref in opf.findall(".//opf:spine/opf:itemref", ns)]
+
+        parts = []
+        for idref in spine:
+            href = manifest.get(idref)
+            if not href:
+                continue
+            path = posixpath.normpath(posixpath.join(opf_dir, urllib.parse.unquote(href)))
+            try:
+                html_bytes = zf.read(path)
+            except KeyError:
+                continue
+            parser = _HTMLTextExtractor()
+            parser.feed(html_bytes.decode("utf-8", errors="replace"))
+            chapter = parser.text()
+            if chapter:
+                parts.append(chapter)
+        return "\n\n".join(parts)
+
+
+MAX_UPLOAD = 100 * 1024 * 1024  # 100 MB
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -71,7 +204,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/extract":
+            self._handle_extract(parsed)
+            return
         if path != "/translate":
             self._send(404, b"not found", "text/plain")
             return
@@ -88,6 +225,33 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, result)
         except Exception as exc:  # 回報給前端顯示,不讓伺服器掛掉
             self._send_json(502, {"error": f"翻譯失敗: {exc}"})
+
+    def _handle_extract(self, parsed):
+        """接收上傳的 PDF/EPUB 原始位元組,回傳抽出的純文字"""
+        try:
+            query = urllib.parse.parse_qs(parsed.query)
+            name = (query.get("name", [""])[0]).lower()
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                self._send_json(400, {"error": "沒有收到檔案內容"})
+                return
+            if length > MAX_UPLOAD:
+                self._send_json(413, {"error": "檔案太大 (上限 100 MB)"})
+                return
+            data = self.rfile.read(length)
+            if name.endswith(".pdf") or data[:5] == b"%PDF-":
+                text = extract_pdf(data)
+            elif name.endswith(".epub") or data[:2] == b"PK":
+                text = extract_epub(data)
+            else:
+                self._send_json(400, {"error": "只支援 .pdf 和 .epub"})
+                return
+            if not text.strip():
+                self._send_json(422, {"error": "抽不出文字 — 可能是掃描圖片版 PDF"})
+                return
+            self._send_json(200, {"text": text})
+        except Exception as exc:
+            self._send_json(500, {"error": f"解析失敗: {exc}"})
 
     def log_message(self, fmt, *args):  # 安靜一點,只留錯誤
         if args and str(args[1]).startswith(("4", "5")):

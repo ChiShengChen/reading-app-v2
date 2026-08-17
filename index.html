@@ -118,8 +118,8 @@
   <!-- 輸入畫面 -->
   <section id="inputView">
     <div class="row">
-      <button class="btn" id="fileBtn">📄 開啟檔案 (.txt / .md)</button>
-      <input type="file" id="fileInput" accept=".txt,.md,.text,text/plain">
+      <button class="btn" id="fileBtn">📄 開啟檔案 (.txt / .md / .pdf / .epub)</button>
+      <input type="file" id="fileInput" accept=".txt,.md,.text,.pdf,.epub,text/plain,application/pdf,application/epub+zip">
       <span class="hint" id="fileName"></span>
     </div>
     <textarea id="srcText" placeholder="把要閱讀的文章貼在這裡（任何語言都可以，會自動偵測）…"></textarea>
@@ -283,13 +283,29 @@ $("target").onchange = () => {   // 閱讀中換語言 → 直接用新語言重
 
 /* 檔案開啟 */
 $("fileBtn").onclick = () => $("fileInput").click();
-$("fileInput").onchange = () => {
+$("fileInput").onchange = async () => {
   const f = $("fileInput").files[0];
   if (!f) return;
-  $("fileName").textContent = f.name;
-  const r = new FileReader();
-  r.onload = () => { $("srcText").value = r.result; };
-  r.readAsText(f);
+  const ext = f.name.toLowerCase().split(".").pop();
+  if (ext === "pdf" || ext === "epub"){
+    $("fileName").textContent = `⏳ 正在解析 ${f.name} …`;
+    try {
+      const resp = await fetch("/extract?name=" + encodeURIComponent(f.name),
+                               { method: "POST", body: f });
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || resp.status);
+      $("srcText").value = data.text;
+      $("fileName").textContent = `${f.name}（${data.text.length.toLocaleString()} 字）`;
+    } catch (err) {
+      $("fileName").textContent = `⚠ ${f.name}: ${err.message}`;
+    }
+  } else {
+    $("fileName").textContent = f.name;
+    const r = new FileReader();
+    r.onload = () => { $("srcText").value = r.result; };
+    r.readAsText(f);
+  }
+  $("fileInput").value = "";   // 同一個檔案可以再選一次
 };
 
 /* 顯示模式 / 字體 / 深淺色 */
